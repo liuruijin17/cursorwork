@@ -11,6 +11,8 @@ def parse_arguments():
     parser.add_argument('json_file', help='JSON文件路径（每行一个JSON对象）')
     parser.add_argument('--model', required=True, help='模型名称')
     parser.add_argument('--output', required=True, help='输出XLSX文件路径')
+    parser.add_argument('--start-time-epoch-base', type=float, default=None,
+                        help='当新JSON仅提供start_time（非epoch）时，指定一个epoch基准秒数，与start_time相加得到绝对时间用于格式化显示')
     return parser.parse_args()
 
 
@@ -56,7 +58,7 @@ def build_row_from_old_format(item: dict, model_name: str, line_num: int):
     }
 
 
-def build_rows_from_new_format(obj: dict, model_name: str, line_num: int):
+def build_rows_from_new_format(obj: dict, model_name: str, line_num: int, start_time_epoch_base: float | None):
     rows = []
 
     # 期望结构：{"<request_id>": {"input_len": int, "output_len": int, "latency": [..], ...}, ...}
@@ -92,9 +94,33 @@ def build_rows_from_new_format(obj: dict, model_name: str, line_num: int):
         else:
             total_time_s = 0.0
 
-        # 旧脚本的 arrive_timestamp 来源于 epoch 秒的 timestamp；新数据给的是单调时钟，无法转换
-        # 这里保留列但使用 start_time 的原始数值字符串，若不存在则为空
-        arrive_ts_str = f"{start_time}" if start_time is not None else ""
+        # arrive_timestamp：尽可能格式化为人类可读时间
+        arrive_ts_str = ""
+        ts_seconds = None
+        # 直接可用的绝对时间戳
+        for key in ("timestamp", "start_timestamp"):
+            if key in record and record[key] is not None:
+                try:
+                    ts_seconds = float(record[key])
+                    break
+                except Exception:
+                    pass
+        if ts_seconds is None and start_time is not None:
+            try:
+                start_time_val = float(start_time)
+                if start_time_epoch_base is not None:
+                    ts_seconds = start_time_val + float(start_time_epoch_base)
+                elif start_time_val >= 946684800.0:  # >= 2000-01-01，大概率是epoch秒
+                    ts_seconds = start_time_val
+            except Exception:
+                ts_seconds = None
+        if ts_seconds is not None:
+            try:
+                arrive_ts_str = datetime.fromtimestamp(ts_seconds).strftime("%Y-%m-%d %H:%M:%S.%f")
+            except Exception:
+                arrive_ts_str = ""
+        if not arrive_ts_str:
+            print(f"提示：第{line_num}行请求{request_id}无法推导绝对到达时间（缺少epoch信息），arrive_timestamp留空。可使用 --start-time-epoch-base 提供基准。")
 
         rows.append({
             "request_id": str(request_id),
@@ -110,7 +136,7 @@ def build_rows_from_new_format(obj: dict, model_name: str, line_num: int):
     return rows
 
 
-def process_line(line: str, model_name: str, line_num: int):
+def process_line(line: str, model_name: str, line_num: int, start_time_epoch_base: float | None):
     stripped_line = line.strip()
     if not stripped_line:
         return []
@@ -129,7 +155,7 @@ def process_line(line: str, model_name: str, line_num: int):
         return [row] if row else []
 
     if isinstance(obj, dict):
-        return build_rows_from_new_format(obj, model_name, line_num)
+        return build_rows_from_new_format(obj, model_name, line_num, start_time_epoch_base)
 
     print(f"警告：第{line_num}行JSON顶层不是对象，已跳过")
     return []
@@ -154,7 +180,7 @@ def main():
 
     with open(args.json_file, 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f, 1):
-            rows = process_line(line, args.model, line_num)
+            rows = process_line(line, args.model, line_num, args.start_time_epoch_base)
             if rows:
                 data_rows.extend(rows)
                 processed_count += len(rows)
