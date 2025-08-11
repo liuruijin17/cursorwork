@@ -6,12 +6,17 @@
     - 下段：首 token 时延
     - 上段：token 增量耗时（若提供逐 token 时延，则求和显示总增量耗时）
   右侧：每个请求的输入输出tokens数量（分组条形图）
+
+同时统计关键列的指标：均值、最大值、最小值、P90、样本量，并在左图叠加均值线。
+- 统计列：Request tokens(input_tokens)、Response tokens(output_tokens)、first_token_time、decode_token_time(使用decode_time，总和)、total_time(ms)
 """
 
 import argparse
 import json
 from pathlib import Path
+from typing import Dict, List
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -35,26 +40,23 @@ def read_dataframe(input_path: str) -> pd.DataFrame:
 
 
 def to_datetime_safe(series: pd.Series) -> pd.Series:
-    # 尝试将字符串解析为 datetime（新数据中可能不是 epoch 时间，转换会产生 NaT）
-    return pd.to_datetime(series, errors="coerce")
+    # 按你的脚本：不做 errors='coerce'，严格解析
+    return pd.to_datetime(series)
 
 
 def compute_decode_time_ms(row: pd.Series) -> float:
     value = row.get("decode_token_time")
     output_tokens = row.get("output_tokens", 0) or 0
 
-    # 已是缺失
     if pd.isna(value):
         return 0.0
 
-    # 若是列表（例如来自 CSV 被正确解析为对象，或我们前置处理过）
     if isinstance(value, list):
         try:
             return float(sum(float(x) for x in value))
         except Exception:
             return 0.0
 
-    # 若是字符串，尝试当作 JSON 数组解析
     if isinstance(value, str):
         stripped = value.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
@@ -63,14 +65,12 @@ def compute_decode_time_ms(row: pd.Series) -> float:
                 return float(sum(float(x) for x in arr))
             except Exception:
                 return 0.0
-        # 退化为数值：视为“平均每 token 时延（毫秒）”，乘以输出 token 数得总增量时长
         try:
             avg_per_token_ms = float(value)
             return avg_per_token_ms * float(output_tokens)
         except Exception:
             return 0.0
 
-    # 退化：将其视为平均值 * 输出 tokens
     try:
         avg_per_token_ms = float(value)
         return avg_per_token_ms * float(output_tokens)
@@ -78,41 +78,77 @@ def compute_decode_time_ms(row: pd.Series) -> float:
         return 0.0
 
 
+def calculate_statistics(data: List[float]) -> Dict:
+    """计算统计指标：均值、最大值、最小值、P90值"""
+    if not data:
+        return {"mean": None, "max": None, "min": None, "p90": None, "count": 0}
+    arr = np.array(list(data), dtype=float)
+    return {
+        "mean": round(float(np.mean(arr)), 4),
+        "max": round(float(np.max(arr)), 4),
+        "min": round(float(np.min(arr)), 4),
+        "p90": round(float(np.percentile(arr, 90)), 4),
+        "count": int(arr.size),
+    }
+
+
 def build_plot(df: pd.DataFrame, output_html: Path) -> None:
     # 时间列处理
     df = df.copy()
-    df["arrive_dt"] = to_datetime_safe(df["arrive_timestamp"])  # 可能为 NaT
-    # 也尝试解析为数值（新数据中可能是单调时钟值）
-    df["arrive_num"] = pd.to_numeric(df["arrive_timestamp"], errors="coerce")
+    df["arrive_timestamp"] = to_datetime_safe(df["arrive_timestamp"])  # 可能为 NaT
 
     # 计算 decode_time（毫秒）与 total_time（秒 -> 毫秒）
     df["decode_time"] = df.apply(compute_decode_time_ms, axis=1)
     df["total_time"] = df["total_time"] * 1000.0
 
-    # 对显示的到达时间做字符串格式化，尽量保留原始精度
-    def format_arrive_display(r: pd.Series) -> str:
-        original = r.get("arrive_timestamp")
-        if pd.notna(original) and str(original) != "NaT":
-            return str(original)
-        if pd.notna(r["arrive_dt"]):
-            return r["arrive_dt"].strftime("%Y-%m-%d %H:%M:%S.%f")
-        if pd.notna(r["arrive_num"]):
-            return str(r["arrive_num"])  # 不做小数截断，保留完整精度
-        return ""
+    # 排序
+    df = df.sort_values('arrive_timestamp').reset_index(drop=True)
 
-    df["arrive_display"] = df.apply(format_arrive_display, axis=1)
+    # y 轴标签：按时间分桶+序号
+    df['s_time'] = df['arrive_timestamp'].dt.floor('S')
+    df['rank'] = df.groupby('s_time').cumcount()
+    df['y_label'] = (
+        df['arrive_timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S.%f') + '_' + df['rank'].astype(str)
+    )
 
-    # 排序：优先按 datetime，其次按数值，最后不变
-    if df["arrive_dt"].notna().any():
-        df = df.sort_values("arrive_dt")
-    elif df["arrive_num"].notna().any():
-        df = df.sort_values("arrive_num")
-    df = df.reset_index(drop=True)
+    # 统计指标（按你的字段命名约定）
+    # Request tokens -> input_tokens, Response tokens -> output_tokens
+    def sanitize_numeric(series: pd.Series) -> List[float]:
+        values: List[float] = []
+        for v in series.tolist():
+            try:
+                if pd.isna(v):
+                    continue
+                fv = float(v)
+                # 与示例逻辑一致：0 和 -1 不纳入统计
+                if fv in (0.0, -1.0):
+                    continue
+                values.append(fv)
+            except Exception:
+                continue
+        return values
 
-    # y 轴标签：使用 arrive_display + 序号
-    df["s_time"] = df["arrive_display"].str.slice(0, 26)  # 限长避免过长
-    df["rank"] = df.groupby("s_time").cumcount()
-    df["y_label"] = df["arrive_display"] + "_" + df["rank"].astype(str)
+    stats_inputs = calculate_statistics(sanitize_numeric(df['input_tokens']))
+    stats_outputs = calculate_statistics(sanitize_numeric(df['output_tokens']))
+    stats_first = calculate_statistics(sanitize_numeric(df['first_token_time']))
+    stats_decode = calculate_statistics(sanitize_numeric(df['decode_time']))  # 使用总增量耗时
+    stats_total = calculate_statistics(sanitize_numeric(df['total_time']))
+
+    # 打印统计结果
+    print("\n===== 统计结果 =====")
+    def print_stats(title: str, stats: Dict):
+        print(f"\n{title}:")
+        print(f"  有效数据量: {stats['count']}")
+        print(f"  均值: {stats['mean']}")
+        print(f"  最大值: {stats['max']}")
+        print(f"  最小值: {stats['min']}")
+        print(f"  P90值: {stats['p90']}")
+
+    print_stats('Request tokens', stats_inputs)
+    print_stats('Response tokens', stats_outputs)
+    print_stats('first_token_time (ms)', stats_first)
+    print_stats('decode_token_time -> decode_time 总和 (ms)', stats_decode)
+    print_stats('total_time (ms)', stats_total)
 
     # 构建图表
     fig = make_subplots(
@@ -132,7 +168,7 @@ def build_plot(df: pd.DataFrame, output_html: Path) -> None:
             orientation="h",
             name="首token时延",
             marker=dict(color="#ff7f0e", line=dict(color="black", width=0.5)),
-            customdata=df[["arrive_display", "first_token_time", "total_time"]],
+            customdata=df[["arrive_timestamp", "first_token_time", "total_time"]],
             hovertemplate=(
                 "到达时间: %{customdata[0]}<br>"
                 "首token时延: %{customdata[1]:.2f} ms<br>"
@@ -152,7 +188,7 @@ def build_plot(df: pd.DataFrame, output_html: Path) -> None:
             orientation="h",
             name="token增量耗时",
             marker=dict(color="#1f77b4", line=dict(color="black", width=0.5)),
-            customdata=df[["arrive_display", "decode_time", "total_time"]],
+            customdata=df[["arrive_timestamp", "decode_time", "total_time"]],
             hovertemplate=(
                 "到达时间: %{customdata[0]}<br>"
                 "增量耗时: %{customdata[1]:.2f} ms<br>"
@@ -163,6 +199,20 @@ def build_plot(df: pd.DataFrame, output_html: Path) -> None:
         col=1,
     )
 
+    # 左侧：均值线（首token均值、总耗时均值）
+    if stats_first["mean"] is not None:
+        fig.add_vline(
+            x=stats_first["mean"], line_dash="dash", line_color="#ff7f0e",
+            annotation_text="首token均值", annotation_font_color="#ff7f0e",
+            row=1, col=1,
+        )
+    if stats_total["mean"] is not None:
+        fig.add_vline(
+            x=stats_total["mean"], line_dash="dash", line_color="#000000",
+            annotation_text="总耗时均值", annotation_font_color="#000000",
+            row=1, col=1,
+        )
+
     # 右侧：input_tokens
     fig.add_trace(
         go.Bar(
@@ -171,7 +221,7 @@ def build_plot(df: pd.DataFrame, output_html: Path) -> None:
             orientation="h",
             name="输入tokens",
             marker=dict(color="#2ca02c", line=dict(color="black", width=0.5)),
-            customdata=df[["arrive_display", "input_tokens"]],
+            customdata=df[["arrive_timestamp", "input_tokens"]],
             hovertemplate=(
                 "到达时间: %{customdata[0]}<br>"
                 "输入tokens: %{customdata[1]}<extra></extra>"
@@ -189,7 +239,7 @@ def build_plot(df: pd.DataFrame, output_html: Path) -> None:
             orientation="h",
             name="输出tokens",
             marker=dict(color="#d62728", line=dict(color="black", width=0.5)),
-            customdata=df[["arrive_display", "output_tokens"]],
+            customdata=df[["arrive_timestamp", "output_tokens"]],
             hovertemplate=(
                 "到达时间: %{customdata[0]}<br>"
                 "输出tokens: %{customdata[1]}<extra></extra>"
