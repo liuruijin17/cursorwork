@@ -4,7 +4,6 @@ from datetime import datetime
 import argparse
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
-from statistics import mean
 
 
 def parse_arguments():
@@ -80,7 +79,7 @@ def build_rows_from_new_format(obj: dict, model_name: str, line_num: int):
 
         first_token_time_ms = float(latency_list[0])
         decode_latencies_ms = [float(x) for x in latency_list[1:]]
-        decode_token_time_ms = mean(decode_latencies_ms) if len(decode_latencies_ms) > 0 else 0.0
+        decode_token_times_str = json.dumps(decode_latencies_ms)
 
         # total_time 按旧脚本保持“秒”为单位
         if req_latency_ms is not None:
@@ -104,7 +103,7 @@ def build_rows_from_new_format(obj: dict, model_name: str, line_num: int):
             "input_tokens": int(input_len),
             "output_tokens": int(output_len),
             "first_token_time": first_token_time_ms,
-            "decode_token_time": decode_token_time_ms,
+            "decode_token_time": decode_token_times_str,
             "total_time": total_time_s,
         })
 
