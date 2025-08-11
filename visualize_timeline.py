@@ -89,14 +89,16 @@ def build_plot(df: pd.DataFrame, output_html: Path) -> None:
     df["decode_time"] = df.apply(compute_decode_time_ms, axis=1)
     df["total_time"] = df["total_time"] * 1000.0
 
-    # 对显示的到达时间做字符串格式化，兼容 NaT/数值
+    # 对显示的到达时间做字符串格式化，尽量保留原始精度
     def format_arrive_display(r: pd.Series) -> str:
+        original = r.get("arrive_timestamp")
+        if pd.notna(original) and str(original) != "NaT":
+            return str(original)
         if pd.notna(r["arrive_dt"]):
             return r["arrive_dt"].strftime("%Y-%m-%d %H:%M:%S.%f")
         if pd.notna(r["arrive_num"]):
-            return f"start_time={r['arrive_num']:.6f}"
-        # 兜底：保留原始字符串
-        return str(r.get("arrive_timestamp", ""))
+            return str(r["arrive_num"])  # 不做小数截断，保留完整精度
+        return ""
 
     df["arrive_display"] = df.apply(format_arrive_display, axis=1)
 
