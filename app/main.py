@@ -14,6 +14,8 @@ from .config import (
     TOKEN_LOG_PATH,
     UPSTREAM_BASE_URL,
     UPSTREAM_TIMEOUT_SECS,
+    BATCH_ID_HEADER_CANDIDATES,
+    BATCH_ID_JSON_KEYS,
 )
 from .token_logger import AsyncJSONLLogger, TokenEventLogger
 
@@ -89,7 +91,7 @@ async def _stream_and_log(
         async with client.stream("POST", upstream_url, json=payload, headers=req_headers, timeout=UPSTREAM_TIMEOUT_SECS) as resp:
             for key, value in resp.headers.items():
                 lk = key.lower()
-                if lk in ("x-vllm-batch-id", "x-batch-id", "x-scheduler-batch-id"):
+                if lk in BATCH_ID_HEADER_CANDIDATES:
                     batch_id_from_headers = value
                     break
 
@@ -109,16 +111,25 @@ async def _stream_and_log(
                 except json.JSONDecodeError:
                     continue
 
-                request_id = (
-                    chunk.get("id")
-                    or request_id_fallback
-                )
+                request_id = chunk.get("id") or request_id_fallback
 
-                batch_id = (
-                    chunk.get("batch_id")
-                    or chunk.get("vllm_batch_id")
-                    or batch_id_from_headers
-                )
+                batch_id = batch_id_from_headers
+                if not batch_id:
+                    for k in BATCH_ID_JSON_KEYS:
+                        if k in chunk:
+                            batch_id = chunk.get(k)
+                            break
+                    # try nested: choices[0][k]
+                    if not batch_id:
+                        try:
+                            choices = chunk.get("choices", [])
+                            if choices:
+                                for k in BATCH_ID_JSON_KEYS:
+                                    if k in choices[0]:
+                                        batch_id = choices[0].get(k)
+                                        break
+                        except Exception:
+                            pass
 
                 token_text = _extract_token_text(chunk)
                 now = time.perf_counter()

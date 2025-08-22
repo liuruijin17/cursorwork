@@ -90,7 +90,7 @@ class TokenEventLogger:
             "is_prefill": True,
             "batch_id": batch_id,
             "request_id": request_id,
-            "token_idx": -1,
+            "token_idx": 0,
             "unit": "ms",
             "generation_token": float(f"{prefill_ms:.3f}"),
         }
