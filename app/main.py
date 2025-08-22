@@ -158,11 +158,25 @@ async def _proxy_json(
     return JSONResponse(status_code=resp.status_code, content=resp.json())
 
 
-def _collect_forward_headers(request: Request, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def _collect_forward_headers(request: Request, extra: Optional[Dict[str, str]] = None, prefer_event_stream: bool = False) -> Dict[str, str]:
+    banned = {
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "accept-encoding",
+        "expect",
+    }
     headers: Dict[str, str] = {}
     for k, v in request.headers.items():
-        # Forward most headers including Authorization and OpenAI-* ones
+        lk = k.lower()
+        if lk in banned:
+            continue
         headers[k] = v
+    # Ensure correct content type for JSON body we send
+    headers["Content-Type"] = "application/json"
+    if prefer_event_stream:
+        headers["Accept"] = "text/event-stream"
     if extra:
         headers.update(extra)
     return headers
@@ -184,7 +198,7 @@ async def chat_completions(request: Request) -> Response:
         generator = _stream_and_log(
             upstream_url=upstream_url,
             payload=payload,
-            req_headers=_collect_forward_headers(request),
+            req_headers=_collect_forward_headers(request, prefer_event_stream=True),
             token_logger=token_logger,
         )
         return StreamingResponse(generator, media_type="text/event-stream")
@@ -207,7 +221,7 @@ async def completions(request: Request) -> Response:
         generator = _stream_and_log(
             upstream_url=upstream_url,
             payload=payload,
-            req_headers=_collect_forward_headers(request),
+            req_headers=_collect_forward_headers(request, prefer_event_stream=True),
             token_logger=token_logger,
         )
         return StreamingResponse(generator, media_type="text/event-stream")
@@ -225,26 +239,30 @@ async def passthrough(request: Request, path: str) -> Response:
     upstream_url = _join_upstream_url("/v1/" + path)
     method = request.method.upper()
 
-    async with httpx.AsyncClient(http2=True) as client:
-        if method == "GET":
+    if method == "GET":
+        async with httpx.AsyncClient(http2=True) as client:
             resp = await client.get(upstream_url, params=dict(request.query_params), headers=_collect_forward_headers(request), timeout=UPSTREAM_TIMEOUT_SECS)
-        elif method == "POST":
-            # Try JSON, fallback to body
-            try:
-                payload = await request.json()
+    elif method == "POST":
+        try:
+            payload = await request.json()
+            async with httpx.AsyncClient(http2=True) as client:
                 resp = await client.post(upstream_url, json=payload, headers=_collect_forward_headers(request), timeout=UPSTREAM_TIMEOUT_SECS)
-            except Exception:
-                body = await request.body()
+        except Exception:
+            body = await request.body()
+            async with httpx.AsyncClient(http2=True) as client:
                 resp = await client.post(upstream_url, content=body, headers=_collect_forward_headers(request), timeout=UPSTREAM_TIMEOUT_SECS)
-        elif method == "PUT":
-            body = await request.body()
+    elif method == "PUT":
+        body = await request.body()
+        async with httpx.AsyncClient(http2=True) as client:
             resp = await client.put(upstream_url, content=body, headers=_collect_forward_headers(request), timeout=UPSTREAM_TIMEOUT_SECS)
-        elif method == "PATCH":
-            body = await request.body()
+    elif method == "PATCH":
+        body = await request.body()
+        async with httpx.AsyncClient(http2=True) as client:
             resp = await client.patch(upstream_url, content=body, headers=_collect_forward_headers(request), timeout=UPSTREAM_TIMEOUT_SECS)
-        elif method == "DELETE":
+    elif method == "DELETE":
+        async with httpx.AsyncClient(http2=True) as client:
             resp = await client.delete(upstream_url, headers=_collect_forward_headers(request), timeout=UPSTREAM_TIMEOUT_SECS)
-        else:
-            return JSONResponse(status_code=405, content={"error": "method not allowed"})
+    else:
+        return JSONResponse(status_code=405, content={"error": "method not allowed"})
 
     return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
