@@ -46,6 +46,7 @@ for mod_path, cls_name, method_names in [
         mod = importlib.import_module(mod_path)
         cls = getattr(mod, cls_name, None)
         if cls is None:
+            _debug(f"class not found: {mod_path}.{cls_name}")
             continue
         target_attr = None
         for name in method_names:
@@ -53,6 +54,7 @@ for mod_path, cls_name, method_names in [
                 target_attr = name
                 break
         if target_attr is None:
+            _debug(f"no target method on {mod_path}.{cls_name} candidates={method_names}")
             continue
         orig = getattr(cls, target_attr)
 
@@ -62,9 +64,11 @@ for mod_path, cls_name, method_names in [
                 engine_id = getattr(req, "request_id", None) or getattr(req, "id", None)
                 openai_id = getattr(req, "openai_request_id", None) or getattr(req, "request_id_str", None)
                 if not openai_id:
-                    # Some server paths store outward id on request "id" or build later; synthesize if absent
                     openai_id = getattr(req, "id", None) or f"chatcmpl-{uuid.uuid4().hex}"
-                    setattr(req, "openai_request_id", openai_id)
+                    try:
+                        setattr(req, "openai_request_id", openai_id)
+                    except Exception:
+                        pass
                 if engine_id and openai_id:
                     _append_jsonl(REQ_MAP_FILE, {
                         "type": "request_map",
@@ -72,6 +76,7 @@ for mod_path, cls_name, method_names in [
                         "openai_request_id": str(openai_id),
                         "ts": time.time(),
                     })
+                    _debug(f"map wrote engine={engine_id} openai={openai_id}")
             except Exception as e:
                 _debug(f"openai map error: {e}")
             return req
@@ -83,53 +88,85 @@ for mod_path, cls_name, method_names in [
     except Exception as e:
         _debug(f"probe failed: {mod_path}.{cls_name}: {e}")
 
-# Fallback: engine-level hook captures engine request ids and attempts to infer outward id from args
-if not patched_openai_entry:
+
+# Patch 1b: engine-level add_request variants
+def _try_patch_engine(path: str, cls_name: str, method_names: List[str]) -> bool:
     try:
-        mod = importlib.import_module("vllm.engine.async_llm_engine")
-        eng_cls = getattr(mod, "AsyncLLMEngine", None)
-        if eng_cls is not None and hasattr(eng_cls, "add_request"):
-            orig_add = getattr(eng_cls, "add_request")
+        mod = importlib.import_module(path)
+        cls = getattr(mod, cls_name, None)
+        if cls is None:
+            _debug(f"engine class not found: {path}.{cls_name}")
+            return False
+        target = None
+        for m in method_names:
+            if hasattr(cls, m):
+                target = m
+                break
+        if target is None:
+            _debug(f"no engine method on {path}.{cls_name} candidates={method_names}")
+            return False
+        orig = getattr(cls, target)
 
-            def _wrapped_add_request(self, *args, **kwargs):
-                # Try to extract engine request id and an outward id if provided by caller
-                engine_id = None
-                outward_id = None
-                try:
-                    if "request_id" in kwargs:
-                        engine_id = kwargs.get("request_id")
-                    elif len(args) >= 1:
-                        engine_id = args[0]
-                    outward_id = kwargs.get("openai_request_id") or kwargs.get("request_id_str")
-                except Exception:
-                    pass
-                if engine_id:
-                    _append_jsonl(REQ_MAP_FILE, {
-                        "type": "request_map",
-                        "engine_request_id": str(engine_id),
-                        "openai_request_id": str(outward_id or engine_id),
-                        "ts": time.time(),
-                    })
-                return orig_add(self, *args, **kwargs)
+        def _wrapped_add_request(self, *args, **kwargs):
+            engine_id = None
+            outward_id = None
+            try:
+                if "request_id" in kwargs:
+                    engine_id = kwargs.get("request_id")
+                elif len(args) >= 1:
+                    engine_id = args[0]
+                outward_id = kwargs.get("openai_request_id") or kwargs.get("request_id_str")
+            except Exception:
+                pass
+            if engine_id:
+                _append_jsonl(REQ_MAP_FILE, {
+                    "type": "request_map",
+                    "engine_request_id": str(engine_id),
+                    "openai_request_id": str(outward_id or engine_id),
+                    "ts": time.time(),
+                })
+                _debug(f"engine map wrote engine={engine_id} openai={outward_id or engine_id}")
+            return orig(self, *args, **kwargs)
 
-            setattr(eng_cls, "add_request", _wrapped_add_request)
-            _debug("patched AsyncLLMEngine.add_request")
+        setattr(cls, target, _wrapped_add_request)
+        _debug(f"patched {path}.{cls_name}.{target}")
+        return True
     except Exception as e:
-        _debug(f"engine-level hook failed: {e}")
+        _debug(f"engine patch failed: {path}.{cls_name}: {e}")
+        return False
 
 
-# Patch 2: capture batch formation at scheduler layer
-try:
-    from vllm.engine.scheduler import Scheduler
+if not patched_openai_entry:
+    patched_engine = False
+    # Async engine
+    patched_engine |= _try_patch_engine("vllm.engine.async_llm_engine", "AsyncLLMEngine", ["add_request", "_add_request"])  # type: ignore[assignment]
+    # Sync engine
+    patched_engine |= _try_patch_engine("vllm.engine.llm_engine", "LLMEngine", ["add_request", "_add_request"])  # type: ignore[assignment]
+    if not patched_engine:
+        _debug("no engine add_request patched")
 
-    schedule_attr = None
-    if hasattr(Scheduler, "schedule"):
-        schedule_attr = "schedule"
-    elif hasattr(Scheduler, "_schedule"):
-        schedule_attr = "_schedule"
 
-    if schedule_attr is not None:
-        orig_schedule = getattr(Scheduler, schedule_attr)
+# Patch 2: capture batch formation at scheduler layer (probe multiple paths)
+for sched_mod in [
+    "vllm.engine.scheduler",
+    "vllm.core.scheduler",
+    "vllm.core.scheduler_core",
+]:
+    try:
+        mod = importlib.import_module(sched_mod)
+        cls = getattr(mod, "Scheduler", None)
+        if cls is None:
+            _debug(f"Scheduler not found in {sched_mod}")
+            continue
+        schedule_attr = None
+        for cand in ("schedule", "_schedule"):
+            if hasattr(cls, cand):
+                schedule_attr = cand
+                break
+        if schedule_attr is None:
+            _debug(f"no schedule method on Scheduler in {sched_mod}")
+            continue
+        orig_schedule = getattr(cls, schedule_attr)
 
         def _wrapped_schedule(self, *args, **kwargs):
             result = orig_schedule(self, *args, **kwargs)
@@ -142,7 +179,7 @@ try:
                         if eid:
                             engine_ids.append(str(eid))
                 else:
-                    maybe_reqs = getattr(result, "scheduled_requests", None) or getattr(result, "requests", None)
+                    maybe_reqs = getattr(result, "scheduled_requests", None) or getattr(result, "requests", None) or getattr(result, "seq_groups", None)
                     if isinstance(maybe_reqs, (list, tuple)):
                         for item in maybe_reqs:
                             eid = getattr(item, "request_id", None) or getattr(item, "id", None)
@@ -155,12 +192,13 @@ try:
                         "engine_request_ids": engine_ids,
                         "ts": time.time(),
                     })
-                    _debug(f"batch formed {batch_id} with {len(engine_ids)} reqs")
+                    _debug(f"batch formed {batch_id} with {len(engine_ids)} reqs via {sched_mod}.{schedule_attr}")
             except Exception as e:
                 _debug(f"scheduler hook error: {e}")
             return result
 
-        setattr(Scheduler, schedule_attr, _wrapped_schedule)
-        _debug(f"patched Scheduler.{schedule_attr}")
-except Exception as e:
-    _debug(f"scheduler hook failed: {e}")
+        setattr(cls, schedule_attr, _wrapped_schedule)
+        _debug(f"patched Scheduler in {sched_mod}.{schedule_attr}")
+        break
+    except Exception as e:
+        _debug(f"scheduler hook failed in {sched_mod}: {e}")
