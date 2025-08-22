@@ -342,3 +342,162 @@ try:
         _debug("patched AsyncLLMEngine.__init__ to wrap scheduler")
 except Exception as e:
     _debug(f"AsyncLLMEngine instance-level hook failed: {e}")
+
+# Intercept future engine.scheduler assignments to ensure schedule is wrapped
+try:
+    mod = importlib.import_module("vllm.engine.llm_engine")
+    LLMEngine = getattr(mod, "LLMEngine", None)
+    if LLMEngine is not None and hasattr(LLMEngine, "__setattr__"):
+        _orig_llm_setattr = LLMEngine.__setattr__
+        def _wrapped_llm_setattr(self, name, value):
+            _orig_llm_setattr(self, name, value)
+            try:
+                if name == "scheduler" and value is not None:
+                    sched = getattr(self, "scheduler", None)
+                    if sched is not None and hasattr(sched, "schedule"):
+                        try:
+                            orig = sched.schedule
+                            def _wrapped_schedule(*s_args, **s_kwargs):
+                                result = orig(*s_args, **s_kwargs)
+                                try:
+                                    engine_ids: List[str] = []
+                                    batch_id = f"vllm_batch_{uuid.uuid4().hex}"
+                                    outputs = None
+                                    if isinstance(result, tuple) and len(result) >= 2:
+                                        outputs = result[1]
+                                    if outputs is None:
+                                        outputs = result
+                                    seq_groups_container = getattr(outputs, "scheduled_seq_groups", None)
+                                    if seq_groups_container is not None:
+                                        for item in list(seq_groups_container):
+                                            try:
+                                                seq_group = getattr(item, "seq_group", None) or item
+                                                eid = getattr(seq_group, "request_id", None) or getattr(seq_group, "id", None)
+                                                if eid:
+                                                    engine_ids.append(str(eid))
+                                            except Exception:
+                                                continue
+                                    _append_jsonl(BATCH_FILE, {
+                                        "type": "batch_formed",
+                                        "batch_id": batch_id,
+                                        "engine_request_ids": engine_ids,
+                                        "ts": time.time(),
+                                    })
+                                    _debug(f"__setattr__ hook batch engine_ids={len(engine_ids)}")
+                                except Exception as e:
+                                    _debug(f"__setattr__ scheduler hook error: {e}")
+                                return result
+                            setattr(sched, "schedule", _wrapped_schedule)
+                            _debug("wrapped scheduler.schedule via LLMEngine.__setattr__")
+                        except Exception as e:
+                            _debug(f"failed to wrap scheduler via LLMEngine.__setattr__: {e}")
+            except Exception as e:
+                _debug(f"LLMEngine.__setattr__ post-wrap error: {e}")
+        LLMEngine.__setattr__ = _wrapped_llm_setattr
+        _debug("patched LLMEngine.__setattr__ to wrap scheduler on assignment")
+except Exception as e:
+    _debug(f"LLMEngine __setattr__ hook failed: {e}")
+
+try:
+    mod = importlib.import_module("vllm.engine.async_llm_engine")
+    AsyncLLMEngine = getattr(mod, "AsyncLLMEngine", None)
+    if AsyncLLMEngine is not None and hasattr(AsyncLLMEngine, "__setattr__"):
+        _orig_async_setattr = AsyncLLMEngine.__setattr__
+        def _wrapped_async_setattr(self, name, value):
+            _orig_async_setattr(self, name, value)
+            try:
+                if name == "scheduler" and value is not None:
+                    sched = getattr(self, "scheduler", None)
+                    if sched is not None and hasattr(sched, "schedule"):
+                        try:
+                            orig = sched.schedule
+                            def _wrapped_schedule(*s_args, **s_kwargs):
+                                result = orig(*s_args, **s_kwargs)
+                                try:
+                                    engine_ids: List[str] = []
+                                    batch_id = f"vllm_batch_{uuid.uuid4().hex}"
+                                    outputs = None
+                                    if isinstance(result, tuple) and len(result) >= 2:
+                                        outputs = result[1]
+                                    if outputs is None:
+                                        outputs = result
+                                    seq_groups_container = getattr(outputs, "scheduled_seq_groups", None)
+                                    if seq_groups_container is not None:
+                                        for item in list(seq_groups_container):
+                                            try:
+                                                seq_group = getattr(item, "seq_group", None) or item
+                                                eid = getattr(seq_group, "request_id", None) or getattr(seq_group, "id", None)
+                                                if eid:
+                                                    engine_ids.append(str(eid))
+                                            except Exception:
+                                                continue
+                                    _append_jsonl(BATCH_FILE, {
+                                        "type": "batch_formed",
+                                        "batch_id": batch_id,
+                                        "engine_request_ids": engine_ids,
+                                        "ts": time.time(),
+                                    })
+                                    _debug(f"__setattr__ hook batch(engine-async) engine_ids={len(engine_ids)}")
+                                except Exception as e:
+                                    _debug(f"__setattr__ async scheduler hook error: {e}")
+                                return result
+                            setattr(sched, "schedule", _wrapped_schedule)
+                            _debug("wrapped scheduler.schedule via AsyncLLMEngine.__setattr__")
+                        except Exception as e:
+                            _debug(f"failed to wrap scheduler via AsyncLLMEngine.__setattr__: {e}")
+            except Exception as e:
+                _debug(f"AsyncLLMEngine.__setattr__ post-wrap error: {e}")
+        AsyncLLMEngine.__setattr__ = _wrapped_async_setattr
+        _debug("patched AsyncLLMEngine.__setattr__ to wrap scheduler on assignment")
+except Exception as e:
+    _debug(f"AsyncLLMEngine __setattr__ hook failed: {e}")
+
+# Class-level wrap of internal scheduling paths to be robust to overrides
+try:
+    mod = importlib.import_module("vllm.core.scheduler")
+    SchedulerCls = getattr(mod, "Scheduler", None)
+    def _emit_from_outputs(outputs, tag: str):
+        try:
+            engine_ids: List[str] = []
+            batch_id = f"vllm_batch_{uuid.uuid4().hex}"
+            seq_groups_container = getattr(outputs, "scheduled_seq_groups", None)
+            if seq_groups_container is not None:
+                for item in list(seq_groups_container):
+                    try:
+                        seq_group = getattr(item, "seq_group", None) or item
+                        eid = getattr(seq_group, "request_id", None) or getattr(seq_group, "id", None)
+                        if eid:
+                            engine_ids.append(str(eid))
+                    except Exception:
+                        continue
+            _append_jsonl(BATCH_FILE, {
+                "type": "batch_formed",
+                "batch_id": batch_id,
+                "engine_request_ids": engine_ids,
+                "ts": time.time(),
+            })
+            _debug(f"{tag} emit engine_ids={len(engine_ids)}")
+        except Exception as e:
+            _debug(f"{tag} emit error: {e}")
+
+    if SchedulerCls is not None:
+        for meth in ["_schedule", "_schedule_default", "_schedule_chunked_prefill"]:
+            if hasattr(SchedulerCls, meth):
+                orig = getattr(SchedulerCls, meth)
+                def _make_wrap(o, name):
+                    def _wrapped(self, *args, **kwargs):
+                        out = o(self, *args, **kwargs)
+                        # _schedule returns outputs; default/chunked also return outputs
+                        try:
+                            _emit_from_outputs(out, f"{name}")
+                        except Exception as e:
+                            _debug(f"wrapper {name} error: {e}")
+                        return out
+                    return _wrapped
+                try:
+                    setattr(SchedulerCls, meth, _make_wrap(orig, meth))
+                    _debug(f"wrapped Scheduler.{meth}")
+                except Exception as e:
+                    _debug(f"failed to wrap Scheduler.{meth}: {e}")
+except Exception as e:
+    _debug(f"class-level _schedule wrapping failed: {e}")
