@@ -73,7 +73,6 @@ def _extract_finish_reason(chunk: Dict[str, Any]) -> Optional[str]:
 
 
 async def _stream_and_log(
-    client: httpx.AsyncClient,
     upstream_url: str,
     payload: Dict[str, Any],
     req_headers: Dict[str, str],
@@ -86,81 +85,76 @@ async def _stream_and_log(
     request_id_fallback = f"req_{uuid.uuid4()}"
     batch_id_from_headers: Optional[str] = None
 
-    async with client.stream("POST", upstream_url, json=payload, headers=req_headers, timeout=UPSTREAM_TIMEOUT_SECS) as resp:
-        # Try to capture potential batch id from headers if present
-        for key, value in resp.headers.items():
-            lk = key.lower()
-            if lk in ("x-vllm-batch-id", "x-batch-id", "x-scheduler-batch-id"):
-                batch_id_from_headers = value
-                break
+    async with httpx.AsyncClient(http2=True) as client:
+        async with client.stream("POST", upstream_url, json=payload, headers=req_headers, timeout=UPSTREAM_TIMEOUT_SECS) as resp:
+            for key, value in resp.headers.items():
+                lk = key.lower()
+                if lk in ("x-vllm-batch-id", "x-batch-id", "x-scheduler-batch-id"):
+                    batch_id_from_headers = value
+                    break
 
-        async for raw_line in resp.aiter_lines():
-            # Forward exactly as received
-            if raw_line is None:
-                continue
-            line = raw_line.rstrip("\r")
-            yield (line + "\n").encode("utf-8")
+            async for raw_line in resp.aiter_lines():
+                if raw_line is None:
+                    continue
+                line = raw_line.rstrip("\r")
+                yield (line + "\n").encode("utf-8")
 
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if not data or data == "[DONE]":
-                continue
-            try:
-                chunk = json.loads(data)
-            except json.JSONDecodeError:
-                continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
 
-            request_id = (
-                chunk.get("id")
-                or request_id_fallback
-            )
+                request_id = (
+                    chunk.get("id")
+                    or request_id_fallback
+                )
 
-            # Also check for batch id in chunk
-            batch_id = (
-                chunk.get("batch_id")
-                or chunk.get("vllm_batch_id")
-                or batch_id_from_headers
-            )
+                batch_id = (
+                    chunk.get("batch_id")
+                    or chunk.get("vllm_batch_id")
+                    or batch_id_from_headers
+                )
 
-            token_text = _extract_token_text(chunk)
-            now = time.perf_counter()
+                token_text = _extract_token_text(chunk)
+                now = time.perf_counter()
 
-            if token_text:
-                if first_token_time is None:
-                    first_token_time = now
-                    prefill_ms = (first_token_time - request_start) * 1000.0
-                    await token_logger.log_prefill(
+                if token_text:
+                    if first_token_time is None:
+                        first_token_time = now
+                        prefill_ms = (first_token_time - request_start) * 1000.0
+                        await token_logger.log_prefill(
+                            request_id=request_id,
+                            batch_id=batch_id,
+                            prefill_ms=prefill_ms,
+                        )
+                        last_token_time = first_token_time
+                    token_idx += 1
+                    gen_ms = (now - (last_token_time or now)) * 1000.0
+                    await token_logger.log_token(
                         request_id=request_id,
                         batch_id=batch_id,
-                        prefill_ms=prefill_ms,
+                        token_idx=token_idx,
+                        gen_ms=gen_ms,
                     )
-                    last_token_time = first_token_time
-                # Compute token generation time as delta from previous token (or first token)
-                token_idx += 1
-                gen_ms = (now - (last_token_time or now)) * 1000.0
-                await token_logger.log_token(
-                    request_id=request_id,
-                    batch_id=batch_id,
-                    token_idx=token_idx,
-                    gen_ms=gen_ms,
-                )
-                last_token_time = now
+                    last_token_time = now
 
-            # Stop when finish_reason present
-            finish_reason = _extract_finish_reason(chunk)
-            if finish_reason is not None:
-                # nothing to do; client will see the final chunk
-                pass
+                finish_reason = _extract_finish_reason(chunk)
+                if finish_reason is not None:
+                    pass
 
 
 async def _proxy_json(
-    client: httpx.AsyncClient,
     upstream_url: str,
     payload: Dict[str, Any],
     req_headers: Dict[str, str],
 ) -> Response:
-    resp = await client.post(upstream_url, json=payload, headers=req_headers, timeout=UPSTREAM_TIMEOUT_SECS)
+    async with httpx.AsyncClient(http2=True) as client:
+        resp = await client.post(upstream_url, json=payload, headers=req_headers, timeout=UPSTREAM_TIMEOUT_SECS)
     return JSONResponse(status_code=resp.status_code, content=resp.json())
 
 
@@ -186,23 +180,20 @@ async def chat_completions(request: Request) -> Response:
     upstream_url = _join_upstream_url(request.url.path)
     token_logger: TokenEventLogger = app.state.token_logger
 
-    async with httpx.AsyncClient(http2=True) as client:
-        if stream:
-            generator = _stream_and_log(
-                client=client,
-                upstream_url=upstream_url,
-                payload=payload,
-                req_headers=_collect_forward_headers(request),
-                token_logger=token_logger,
-            )
-            return StreamingResponse(generator, media_type="text/event-stream")
-        else:
-            return await _proxy_json(
-                client=client,
-                upstream_url=upstream_url,
-                payload=payload,
-                req_headers=_collect_forward_headers(request),
-            )
+    if stream:
+        generator = _stream_and_log(
+            upstream_url=upstream_url,
+            payload=payload,
+            req_headers=_collect_forward_headers(request),
+            token_logger=token_logger,
+        )
+        return StreamingResponse(generator, media_type="text/event-stream")
+    else:
+        return await _proxy_json(
+            upstream_url=upstream_url,
+            payload=payload,
+            req_headers=_collect_forward_headers(request),
+        )
 
 
 @app.post("/v1/completions")
@@ -212,23 +203,20 @@ async def completions(request: Request) -> Response:
     upstream_url = _join_upstream_url(request.url.path)
     token_logger: TokenEventLogger = app.state.token_logger
 
-    async with httpx.AsyncClient(http2=True) as client:
-        if stream:
-            generator = _stream_and_log(
-                client=client,
-                upstream_url=upstream_url,
-                payload=payload,
-                req_headers=_collect_forward_headers(request),
-                token_logger=token_logger,
-            )
-            return StreamingResponse(generator, media_type="text/event-stream")
-        else:
-            return await _proxy_json(
-                client=client,
-                upstream_url=upstream_url,
-                payload=payload,
-                req_headers=_collect_forward_headers(request),
-            )
+    if stream:
+        generator = _stream_and_log(
+            upstream_url=upstream_url,
+            payload=payload,
+            req_headers=_collect_forward_headers(request),
+            token_logger=token_logger,
+        )
+        return StreamingResponse(generator, media_type="text/event-stream")
+    else:
+        return await _proxy_json(
+            upstream_url=upstream_url,
+            payload=payload,
+            req_headers=_collect_forward_headers(request),
+        )
 
 
 # Generic passthrough for other endpoints if needed (no logging)
