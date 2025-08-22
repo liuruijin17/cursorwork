@@ -69,7 +69,7 @@ class BatchIdMapper:
                     if not batch_id:
                         continue
                     for eid in engine_ids:
-                        openai_id = self._engine_to_openai.get(eid)
+                        openai_id = self._engine_to_openai.get(eid) or eid
                         if openai_id:
                             self._openai_to_batch[openai_id] = batch_id
                 self._batch_pos = f.tell()
