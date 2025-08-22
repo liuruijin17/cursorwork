@@ -35,7 +35,10 @@ Set the upstream vLLM OpenAI-compatible base URL (default `http://127.0.0.1:8000
 ```bash
 export UPSTREAM_BASE_URL="http://127.0.0.1:8000/v1"
 export TOKEN_LOG_PATH="/workspace/token_logs.jsonl"  # optional
+# If you're in the project root:
 uvicorn app.main:app --host 0.0.0.0 --port 9000
+# Or from any directory (add project to import path):
+uvicorn app.main:app --host 0.0.0.0 --port 9000 --app-dir /workspace
 ```
 
 Point your client to `http://localhost:9000/v1/...` instead of the vLLM server.
