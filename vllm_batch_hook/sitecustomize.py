@@ -182,7 +182,15 @@ for sched_mod in [
                     outputs = result
                 # Prefer scheduled_seq_groups from outputs
                 seq_groups_container = getattr(outputs, "scheduled_seq_groups", None)
+                num_groups = None
                 if seq_groups_container is not None:
+                    try:
+                        num_groups = len(seq_groups_container)  # may fail if not sized
+                    except Exception:
+                        try:
+                            num_groups = sum(1 for _ in seq_groups_container)
+                        except Exception:
+                            num_groups = -1
                     for item in list(seq_groups_container):
                         try:
                             seq_group = getattr(item, "seq_group", None) or item
@@ -194,25 +202,30 @@ for sched_mod in [
                 else:
                     # Fallback: previous heuristics
                     if isinstance(result, (list, tuple)):
+                        num_groups = len(result)
                         for item in result:
                             eid = getattr(item, "request_id", None) or getattr(item, "id", None)
                             if eid:
                                 engine_ids.append(str(eid))
                     else:
                         maybe_reqs = getattr(result, "scheduled_requests", None) or getattr(result, "requests", None) or getattr(result, "seq_groups", None)
+                        try:
+                            num_groups = len(maybe_reqs) if maybe_reqs is not None else 0
+                        except Exception:
+                            num_groups = -1
                         if isinstance(maybe_reqs, (list, tuple)):
                             for item in maybe_reqs:
                                 eid = getattr(item, "request_id", None) or getattr(item, "id", None)
                                 if eid:
                                     engine_ids.append(str(eid))
-                if engine_ids:
-                    _append_jsonl(BATCH_FILE, {
-                        "type": "batch_formed",
-                        "batch_id": batch_id,
-                        "engine_request_ids": engine_ids,
-                        "ts": time.time(),
-                    })
-                    _debug(f"batch formed {batch_id} with {len(engine_ids)} reqs via {sched_mod}.{schedule_attr}")
+                # Always write a record to make presence observable
+                _append_jsonl(BATCH_FILE, {
+                    "type": "batch_formed",
+                    "batch_id": batch_id,
+                    "engine_request_ids": engine_ids,
+                    "ts": time.time(),
+                })
+                _debug(f"batch observed groups={num_groups} engine_ids={len(engine_ids)} via {sched_mod}.{schedule_attr}")
             except Exception as e:
                 _debug(f"scheduler hook error: {e}")
             return result
