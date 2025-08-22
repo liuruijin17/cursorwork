@@ -173,18 +173,38 @@ for sched_mod in [
             try:
                 engine_ids: List[str] = []
                 batch_id = f"vllm_batch_{uuid.uuid4().hex}"
-                if isinstance(result, (list, tuple)):
-                    for item in result:
-                        eid = getattr(item, "request_id", None) or getattr(item, "id", None)
-                        if eid:
-                            engine_ids.append(str(eid))
+                # v0.9.2rc1 Scheduler.schedule returns (meta_list, outputs, allow_async)
+                outputs = None
+                if isinstance(result, tuple) and len(result) >= 2:
+                    outputs = result[1]
+                # Older/other variants might return a struct directly
+                if outputs is None:
+                    outputs = result
+                # Prefer scheduled_seq_groups from outputs
+                seq_groups_container = getattr(outputs, "scheduled_seq_groups", None)
+                if seq_groups_container is not None:
+                    for item in list(seq_groups_container):
+                        try:
+                            seq_group = getattr(item, "seq_group", None) or item
+                            eid = getattr(seq_group, "request_id", None) or getattr(seq_group, "id", None)
+                            if eid:
+                                engine_ids.append(str(eid))
+                        except Exception:
+                            continue
                 else:
-                    maybe_reqs = getattr(result, "scheduled_requests", None) or getattr(result, "requests", None) or getattr(result, "seq_groups", None)
-                    if isinstance(maybe_reqs, (list, tuple)):
-                        for item in maybe_reqs:
+                    # Fallback: previous heuristics
+                    if isinstance(result, (list, tuple)):
+                        for item in result:
                             eid = getattr(item, "request_id", None) or getattr(item, "id", None)
                             if eid:
                                 engine_ids.append(str(eid))
+                    else:
+                        maybe_reqs = getattr(result, "scheduled_requests", None) or getattr(result, "requests", None) or getattr(result, "seq_groups", None)
+                        if isinstance(maybe_reqs, (list, tuple)):
+                            for item in maybe_reqs:
+                                eid = getattr(item, "request_id", None) or getattr(item, "id", None)
+                                if eid:
+                                    engine_ids.append(str(eid))
                 if engine_ids:
                     _append_jsonl(BATCH_FILE, {
                         "type": "batch_formed",
