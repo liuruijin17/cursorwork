@@ -235,3 +235,110 @@ for sched_mod in [
         break
     except Exception as e:
         _debug(f"scheduler hook failed in {sched_mod}: {e}")
+
+# Instance-level patch: wrap scheduler.schedule after engine constructs the scheduler
+try:
+    mod = importlib.import_module("vllm.engine.llm_engine")
+    LLMEngine = getattr(mod, "LLMEngine", None)
+    if LLMEngine is not None and hasattr(LLMEngine, "__init__"):
+        _orig_llm_init = LLMEngine.__init__
+        def _wrapped_llm_init(self, *args, **kwargs):
+            _orig_llm_init(self, *args, **kwargs)
+            try:
+                sched = getattr(self, "scheduler", None)
+                if sched is not None and hasattr(sched, "schedule"):
+                    _orig_sched_schedule = sched.schedule
+                    def _wrapped_schedule(*s_args, **s_kwargs):
+                        result = _orig_sched_schedule(*s_args, **s_kwargs)
+                        try:
+                            engine_ids: List[str] = []
+                            batch_id = f"vllm_batch_{uuid.uuid4().hex}"
+                            outputs = None
+                            if isinstance(result, tuple) and len(result) >= 2:
+                                outputs = result[1]
+                            if outputs is None:
+                                outputs = result
+                            seq_groups_container = getattr(outputs, "scheduled_seq_groups", None)
+                            if seq_groups_container is not None:
+                                for item in list(seq_groups_container):
+                                    try:
+                                        seq_group = getattr(item, "seq_group", None) or item
+                                        eid = getattr(seq_group, "request_id", None) or getattr(seq_group, "id", None)
+                                        if eid:
+                                            engine_ids.append(str(eid))
+                                    except Exception:
+                                        continue
+                            _append_jsonl(BATCH_FILE, {
+                                "type": "batch_formed",
+                                "batch_id": batch_id,
+                                "engine_request_ids": engine_ids,
+                                "ts": time.time(),
+                            })
+                            _debug(f"instance hook batch engine_ids={len(engine_ids)}")
+                        except Exception as e:
+                            _debug(f"instance scheduler hook error: {e}")
+                        return result
+                    try:
+                        setattr(sched, "schedule", _wrapped_schedule)
+                        _debug("wrapped instance scheduler.schedule on LLMEngine")
+                    except Exception as e:
+                        _debug(f"failed wrapping instance scheduler on LLMEngine: {e}")
+            except Exception as e:
+                _debug(f"LLMEngine.__init__ post-wrap error: {e}")
+        LLMEngine.__init__ = _wrapped_llm_init
+        _debug("patched LLMEngine.__init__ to wrap scheduler")
+except Exception as e:
+    _debug(f"LLMEngine instance-level hook failed: {e}")
+
+try:
+    mod = importlib.import_module("vllm.engine.async_llm_engine")
+    AsyncLLMEngine = getattr(mod, "AsyncLLMEngine", None)
+    if AsyncLLMEngine is not None and hasattr(AsyncLLMEngine, "__init__"):
+        _orig_async_init = AsyncLLMEngine.__init__
+        def _wrapped_async_init(self, *args, **kwargs):
+            _orig_async_init(self, *args, **kwargs)
+            try:
+                sched = getattr(self, "scheduler", None)
+                if sched is not None and hasattr(sched, "schedule"):
+                    _orig_sched_schedule = sched.schedule
+                    def _wrapped_schedule(*s_args, **s_kwargs):
+                        result = _orig_sched_schedule(*s_args, **s_kwargs)
+                        try:
+                            engine_ids: List[str] = []
+                            batch_id = f"vllm_batch_{uuid.uuid4().hex}"
+                            outputs = None
+                            if isinstance(result, tuple) and len(result) >= 2:
+                                outputs = result[1]
+                            if outputs is None:
+                                outputs = result
+                            seq_groups_container = getattr(outputs, "scheduled_seq_groups", None)
+                            if seq_groups_container is not None:
+                                for item in list(seq_groups_container):
+                                    try:
+                                        seq_group = getattr(item, "seq_group", None) or item
+                                        eid = getattr(seq_group, "request_id", None) or getattr(seq_group, "id", None)
+                                        if eid:
+                                            engine_ids.append(str(eid))
+                                    except Exception:
+                                        continue
+                            _append_jsonl(BATCH_FILE, {
+                                "type": "batch_formed",
+                                "batch_id": batch_id,
+                                "engine_request_ids": engine_ids,
+                                "ts": time.time(),
+                            })
+                            _debug(f"instance hook batch(engine-async) engine_ids={len(engine_ids)}")
+                        except Exception as e:
+                            _debug(f"instance async scheduler hook error: {e}")
+                        return result
+                    try:
+                        setattr(sched, "schedule", _wrapped_schedule)
+                        _debug("wrapped instance scheduler.schedule on AsyncLLMEngine")
+                    except Exception as e:
+                        _debug(f"failed wrapping instance scheduler on AsyncLLMEngine: {e}")
+            except Exception as e:
+                _debug(f"AsyncLLMEngine.__init__ post-wrap error: {e}")
+        AsyncLLMEngine.__init__ = _wrapped_async_init
+        _debug("patched AsyncLLMEngine.__init__ to wrap scheduler")
+except Exception as e:
+    _debug(f"AsyncLLMEngine instance-level hook failed: {e}")
