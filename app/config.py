@@ -30,3 +30,6 @@ BATCH_ID_JSON_KEYS = get_env_list(
     "BATCH_ID_JSON_KEYS",
     "batch_id,vllm_batch_id,batchId,batchID",
 )
+
+# Directory where the vLLM hook will emit JSONL logs
+HOOK_LOG_DIR: str = get_env("VLLM_HOOK_LOG_DIR", "/tmp/vllm_hook")

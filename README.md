@@ -48,3 +48,22 @@ Point your client to `http://localhost:9000/v1/...` instead of the vLLM server.
 - Logging is most accurate with `stream=true` requests. For non-stream requests, the proxy forwards responses without per-token logging.
 - `batch_id` is logged only if upstream provides a header like `X-VLLM-Batch-ID` or includes it in the chunk JSON; otherwise it is `null`.
 - The prefill record is synthetic and marks the time until the first output token.
+
+## Capture true vLLM batch ids (optional)
+
+To enrich `batch_id` even if vLLM doesn't expose it in responses, preload a small monkey-patch in the vLLM process:
+
+```bash
+# 1) Make the hook visible to vLLM Python
+export PYTHONPATH="/workspace/vllm_batch_hook:$PYTHONPATH"
+# 2) Choose a directory for hook logs (default /tmp/vllm_hook)
+export VLLM_HOOK_LOG_DIR="/tmp/vllm_hook"
+# 3) Start vLLM as usual
+python -m vllm.entrypoints.openai.api_server --model /path/to/model --port 8000
+```
+
+What it does:
+- Logs engine_request_id <-> openai_request_id mapping to `${VLLM_HOOK_LOG_DIR}/request_map.jsonl`
+- Logs scheduler batch formation events with a generated `batch_id` and the list of engine request ids to `${VLLM_HOOK_LOG_DIR}/batch_events.jsonl`
+
+The proxy will read those files and map each streaming `request_id` to a `batch_id` as soon as they are available, so `batch_id` in your JSONL logs will be populated even if the upstream response omits it.

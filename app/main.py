@@ -8,6 +8,7 @@ import httpx
 from fastapi import FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .batch_ingest import BatchIdMapper
 from .config import (
     LOG_ROTATE_KEEP,
     LOG_ROTATE_MAX_BYTES,
@@ -16,6 +17,7 @@ from .config import (
     UPSTREAM_TIMEOUT_SECS,
     BATCH_ID_HEADER_CANDIDATES,
     BATCH_ID_JSON_KEYS,
+    HOOK_LOG_DIR,
 )
 from .token_logger import AsyncJSONLLogger, TokenEventLogger
 
@@ -33,12 +35,18 @@ async def _on_startup() -> None:
     await jsonl_logger.start()
     app.state.jsonl_logger = jsonl_logger
     app.state.token_logger = TokenEventLogger(jsonl_logger)
+    # Start batch id mapper
+    mapper = BatchIdMapper(HOOK_LOG_DIR)
+    await mapper.start()
+    app.state.batch_mapper = mapper
 
 
 @app.on_event("shutdown")
 async def _on_shutdown() -> None:
     logger: AsyncJSONLLogger = app.state.jsonl_logger
     await logger.stop()
+    if hasattr(app.state, "batch_mapper"):
+        await app.state.batch_mapper.stop()
 
 
 def _join_upstream_url(path: str) -> str:
@@ -113,13 +121,19 @@ async def _stream_and_log(
 
                 request_id = chunk.get("id") or request_id_fallback
 
-                batch_id = batch_id_from_headers
+                # Prefer mapper-provided batch id if available
+                mapped_batch = None
+                try:
+                    mapped_batch = app.state.batch_mapper.get_batch_id(request_id)
+                except Exception:
+                    mapped_batch = None
+
+                batch_id = mapped_batch or batch_id_from_headers
                 if not batch_id:
                     for k in BATCH_ID_JSON_KEYS:
                         if k in chunk:
                             batch_id = chunk.get(k)
                             break
-                    # try nested: choices[0][k]
                     if not batch_id:
                         try:
                             choices = chunk.get("choices", [])
