@@ -279,8 +279,7 @@ try:
                             _debug(f"instance scheduler hook error: {e}")
                         return result
                     try:
-                        setattr(sched, "schedule", _wrapped_schedule)
-                        _debug("wrapped instance scheduler.schedule on LLMEngine")
+                        _wrap_scheduler_methods(sched, tag_prefix="inst-LLMEngine")
                     except Exception as e:
                         _debug(f"failed wrapping instance scheduler on LLMEngine: {e}")
             except Exception as e:
@@ -332,8 +331,7 @@ try:
                             _debug(f"instance async scheduler hook error: {e}")
                         return result
                     try:
-                        setattr(sched, "schedule", _wrapped_schedule)
-                        _debug("wrapped instance scheduler.schedule on AsyncLLMEngine")
+                        _wrap_scheduler_methods(sched, tag_prefix="inst-AsyncLLMEngine")
                     except Exception as e:
                         _debug(f"failed wrapping instance scheduler on AsyncLLMEngine: {e}")
             except Exception as e:
@@ -387,8 +385,7 @@ try:
                                 except Exception as e:
                                     _debug(f"__setattr__ scheduler hook error: {e}")
                                 return result
-                            setattr(sched, "schedule", _wrapped_schedule)
-                            _debug("wrapped scheduler.schedule via LLMEngine.__setattr__")
+                            _wrap_scheduler_methods(sched, tag_prefix="setattr-LLMEngine")
                         except Exception as e:
                             _debug(f"failed to wrap scheduler via LLMEngine.__setattr__: {e}")
             except Exception as e:
@@ -441,8 +438,7 @@ try:
                                 except Exception as e:
                                     _debug(f"__setattr__ async scheduler hook error: {e}")
                                 return result
-                            setattr(sched, "schedule", _wrapped_schedule)
-                            _debug("wrapped scheduler.schedule via AsyncLLMEngine.__setattr__")
+                            _wrap_scheduler_methods(sched, tag_prefix="setattr-AsyncLLMEngine")
                         except Exception as e:
                             _debug(f"failed to wrap scheduler via AsyncLLMEngine.__setattr__: {e}")
             except Exception as e:
@@ -501,3 +497,61 @@ try:
                     _debug(f"failed to wrap Scheduler.{meth}: {e}")
 except Exception as e:
     _debug(f"class-level _schedule wrapping failed: {e}")
+
+def _wrap_scheduler_methods(sched, tag_prefix: str = "inst"):
+    try:
+        mod = getattr(sched.__class__, "__module__", "?")
+        name = getattr(sched.__class__, "__name__", sched.__class__.__qualname__)
+        candidates = [
+            "schedule",
+            "_schedule",
+            "_schedule_default",
+            "_schedule_chunked_prefill",
+            "step",
+            "run",
+        ]
+        present = [m for m in candidates if hasattr(sched, m)]
+        _debug(f"{tag_prefix}: scheduler class={mod}.{name} methods_present={present}")
+        def _wrap(o, mname: str):
+            orig = getattr(o, mname)
+            def _wrapped(*args, **kwargs):
+                res = orig(*args, **kwargs)
+                try:
+                    engine_ids: List[str] = []
+                    batch_id = f"vllm_batch_{uuid.uuid4().hex}"
+                    outputs = None
+                    # Common returns: (meta_list, outputs, allow_async) or outputs
+                    if isinstance(res, tuple) and len(res) >= 2 and hasattr(res[1], "scheduled_seq_groups"):
+                        outputs = res[1]
+                    elif hasattr(res, "scheduled_seq_groups"):
+                        outputs = res
+                    if outputs is not None:
+                        cont = getattr(outputs, "scheduled_seq_groups", None)
+                        if cont is not None:
+                            for item in list(cont):
+                                try:
+                                    seq_group = getattr(item, "seq_group", None) or item
+                                    eid = getattr(seq_group, "request_id", None) or getattr(seq_group, "id", None)
+                                    if eid:
+                                        engine_ids.append(str(eid))
+                                except Exception:
+                                    continue
+                    _append_jsonl(BATCH_FILE, {
+                        "type": "batch_formed",
+                        "batch_id": batch_id,
+                        "engine_request_ids": engine_ids,
+                        "ts": time.time(),
+                    })
+                    _debug(f"{tag_prefix}: {mname} emit engine_ids={len(engine_ids)}")
+                except Exception as e:
+                    _debug(f"{tag_prefix}: {mname} emit error: {e}")
+                return res
+            try:
+                setattr(o, mname, _wrapped)
+                _debug(f"{tag_prefix}: wrapped {mname}")
+            except Exception as e:
+                _debug(f"{tag_prefix}: failed wrap {mname}: {e}")
+        for m in present:
+            _wrap(sched, m)
+    except Exception as e:
+        _debug(f"{tag_prefix}: wrap scheduler methods error: {e}")
